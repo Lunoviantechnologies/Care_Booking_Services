@@ -7,105 +7,72 @@ from sqlalchemy import select, func
 
 from app.db.models.booking import Booking
 from app.db.models.pricing import Pricing
-import httpx
 
 
 # ================= OTP =================
-def generate_otp() -> str:
+def generate_otp():
     return str(random.randint(1000, 9999))
 
 
 # ================= PRICE =================
-async def get_price_from_db(
-    service_type: str, duration: int, persons: int, db: AsyncSession
-) -> Optional[float]:
-
+async def get_price(service_type, duration, persons, db):
     result = await db.execute(
         select(Pricing).where(
-            func.lower(Pricing.service_type) == service_type.lower(),
-            Pricing.duration == duration,
+            Pricing.service_type == service_type, Pricing.duration == duration
         )
     )
 
-    pricing_list = result.scalars().all()
-
-    for p in pricing_list:
-        if p.min_persons and persons < p.min_persons:
-            continue
-        if p.max_persons and persons > p.max_persons:
-            continue
-        return p.price
-
-    return None
-
-
-# ================= TRANSPORT =================
-def calculate_transport_fee(distance_km: float) -> int:
-    if distance_km <= 5:
-        return 0
-    elif distance_km <= 10:
-        return 29
-    return 49
+    pricing = result.scalars().first()
+    return pricing.price if pricing else None
 
 
 # ================= EXTRA =================
-def calculate_extra_charges(
-    is_peak: bool, is_emergency: bool, is_subscription: bool, distance_km: float
-) -> Dict[str, Any]:
+def calculate_extra(data):
+    base = 49
+    convenience = 0 if data.is_subscription else 29
+    transport = 0 if data.distance_km <= 5 else 29 if data.distance_km <= 10 else 49
+    peak = 50 if data.is_peak else 0
+    emergency = 100 if data.is_emergency else 0
 
-    base_extra = 49
-    convenience_fee = 0 if is_subscription else 29
-    transport_fee = calculate_transport_fee(distance_km)
-
-    peak_charge = 50 if is_peak else 0
-    emergency_charge = 100 if is_emergency else 0
-
-    total_extra = (
-        base_extra + convenience_fee + transport_fee + peak_charge + emergency_charge
-    )
+    total = base + convenience + transport + peak + emergency
 
     return {
-        "base_extra": base_extra,
-        "convenience_fee": convenience_fee,
-        "transport_fee": transport_fee,
-        "peak_charge": peak_charge,
-        "emergency_charge": emergency_charge,
-        "total_extra": total_extra,
+        "base_extra": base,
+        "convenience_fee": convenience,
+        "transport_fee": transport,
+        "peak_charge": peak,
+        "emergency_charge": emergency,
+        "total_extra": total,
     }
 
 
-# ================= TOTAL (NO COMMISSION) =================
-def calculate_total(base_price: float, extra: float) -> float:
-    return round(base_price + extra, 2)
-
-
 # ================= CREATE =================
-async def create_booking(
-    data, db: AsyncSession
-) -> Optional[Tuple[Booking, Dict[str, Any]]]:
+async def create_booking(data, user_id, db):
 
-    base_price = await get_price_from_db(
-        data.service_type, data.duration, data.persons, db
-    )
+    price = await get_price(data.service_type, data.duration, data.persons, db)
 
-    if base_price is None:
+    if not price:
         return None
 
-    extra_data = calculate_extra_charges(
-        data.is_peak, data.is_emergency, data.is_subscription, data.distance_km
-    )
-
-    total = calculate_total(base_price, extra_data["total_extra"])
+    extra = calculate_extra(data)
+    total = price + extra["total_extra"]
 
     booking = Booking(
-        service_type=data.service_type.lower(),
+        # customer_id=user_id,
+        service_type=data.service_type,
         duration=data.duration,
         persons=data.persons,
-        base_price=base_price,
-        extra_charges=extra_data["total_extra"],
+        #  full_name=data.full_name,
+        booking_date=data.booking_date,
+        booking_time=data.booking_time,
+        selected_services=data.selected_services,
+        extra_details=data.extra_details,
+        notes=data.notes,
+        base_price=price,
+        extra_charges=extra["total_extra"],
         total_amount=total,
         status="pending",
-        start_otp=generate_otp(),
+        start_otp=generate_otp(),  # ✅ OTP GENERATED HERE
         distance_km=data.distance_km,
     )
 
@@ -113,61 +80,70 @@ async def create_booking(
     await db.commit()
     await db.refresh(booking)
 
-    return booking, extra_data
+    return booking, extra
 
 
-# ================= WORKER SERVICE =================
-async def get_worker(worker_id: int) -> Optional[dict]:
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            res = await client.get(f"http://worker-service/api/worker/{worker_id}")
-            if res.status_code == 200:
-                return res.json()
-    except Exception:
-        return None
-    return None
+# ================= DASHBOARD =================
+async def get_dashboard_stats(user_id, db):
 
-
-# ================= ELIGIBILITY =================
-def is_worker_eligible(worker: dict, booking: Booking) -> bool:
-
-    if worker.get("status") != "approved":
-        return False
-
-    if worker.get("availability") != "online":
-        return False
-
-    if booking.service_type == "baby_care":
-        return worker.get("gender") == "female" and 20 <= worker.get("age", 0) <= 45
-
-    if booking.service_type == "pregnancy_care":
-        return worker.get("gender") == "female" and 23 <= worker.get("age", 0) <= 50
-
-    if booking.service_type in ["kitchen_work", "elder_care", "party_help"]:
-        return 18 <= worker.get("age", 0) <= 60
-
-    return False
-
-
-# ================= AVAILABLE BOOKINGS =================
-async def get_available_bookings(worker_id: int, db: AsyncSession):
-
-    worker = await get_worker(worker_id)
-
-    if not worker:
-        return {"message": "Worker not found"}
-
-    result = await db.execute(
-        select(Booking).where(Booking.status == "pending", Booking.worker_id == None)
+    active = await db.execute(
+        select(func.count()).where(
+            Booking.customer_id == user_id,
+            Booking.status.in_(["pending", "accepted", "started"]),
+        )
     )
 
-    bookings = result.scalars().all()
+    past = await db.execute(
+        select(func.count()).where(
+            Booking.customer_id == user_id,
+            Booking.status == "completed",
+        )
+    )
 
-    return [b for b in bookings if is_worker_eligible(worker, b)]
+    rating = await db.execute(
+        select(func.avg(Booking.rating)).where(
+            Booking.customer_id == user_id, Booking.rating != None
+        )
+    )
+
+    hours = await db.execute(
+        select(func.sum(Booking.working_hours)).where(
+            Booking.customer_id == user_id,
+            Booking.status == "completed",
+        )
+    )
+
+    return {
+        "active_bookings": active.scalar() or 0,
+        "past_sessions": past.scalar() or 0,
+        "rating_given": round(rating.scalar() or 0, 1),
+        "hours_of_care": round(hours.scalar() or 0, 1),
+    }
+
+
+# ================= ADD RATING =================
+async def add_rating(booking_id, rating, db):
+
+    result = await db.execute(select(Booking).where(Booking.id == booking_id))
+    booking = result.scalar_one_or_none()
+
+    if not booking:
+        return None
+
+    booking.rating = rating
+    await db.commit()
+
+    return booking
+
+
+# ================= AVAILABLE =================
+async def get_available_bookings(worker_id, db):
+    result = await db.execute(select(Booking))
+    return result.scalars().all()
 
 
 # ================= ACCEPT =================
-async def accept_booking(booking_id: int, worker_id: int, db: AsyncSession):
+async def accept_booking(booking_id, worker_id, db):
 
     result = await db.execute(select(Booking).where(Booking.id == booking_id))
     booking = result.scalar_one_or_none()
@@ -175,23 +151,15 @@ async def accept_booking(booking_id: int, worker_id: int, db: AsyncSession):
     if not booking:
         return None, "Booking not found"
 
-    if booking.status != "pending":
-        return None, "Already accepted"
-
-    worker = await get_worker(worker_id)
-    if not worker:
-        return None, "Worker not found"
-
     booking.worker_id = worker_id
     booking.status = "accepted"
 
     await db.commit()
-
     return booking, "Accepted"
 
 
-# ================= START =================
-async def start_work(booking_id: int, otp: str, db: AsyncSession):
+# ================= START (OTP VERIFY) =================
+async def start_work(booking_id, otp, db):
 
     result = await db.execute(select(Booking).where(Booking.id == booking_id))
     booking = result.scalar_one_or_none()
@@ -206,12 +174,11 @@ async def start_work(booking_id: int, otp: str, db: AsyncSession):
     booking.start_time = datetime.utcnow()
 
     await db.commit()
-
     return booking, "Started"
 
 
 # ================= END =================
-async def end_work(booking_id: int, db: AsyncSession):
+async def end_work(booking_id, db):
 
     result = await db.execute(select(Booking).where(Booking.id == booking_id))
     booking = result.scalar_one_or_none()
@@ -227,12 +194,11 @@ async def end_work(booking_id: int, db: AsyncSession):
     booking.status = "waiting_for_verification"
 
     await db.commit()
+    return booking, "Ended"
 
-    return booking, "End OTP Generated"
 
-
-# ================= VERIFY (NO COMMISSION) =================
-async def verify_end_otp(booking_id: int, otp: str, db: AsyncSession):
+# ================= VERIFY END OTP =================
+async def verify_end_otp(booking_id, otp, db):
 
     result = await db.execute(select(Booking).where(Booking.id == booking_id))
     booking = result.scalar_one_or_none()
@@ -243,19 +209,14 @@ async def verify_end_otp(booking_id: int, otp: str, db: AsyncSession):
     if booking.end_otp != otp:
         return None, "Invalid OTP"
 
-    price_per_hour = booking.base_price / booking.duration
-    new_base = price_per_hour * booking.working_hours
-
-    booking.total_amount = round(new_base + booking.extra_charges, 2)
     booking.status = "completed"
-
     await db.commit()
 
     return booking, "Completed"
 
 
-# ================= FINAL =================
-async def get_final_amount(booking_id: int, db: AsyncSession):
+# ================= FINAL AMOUNT =================
+async def get_final_amount(booking_id, db):
 
     result = await db.execute(select(Booking).where(Booking.id == booking_id))
     booking = result.scalar_one_or_none()
