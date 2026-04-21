@@ -12,6 +12,8 @@ from app.services.booking_service import (
     end_work,
     verify_end_otp,
     get_final_amount,
+    list_bookings,  # ✅ NEW
+    get_booking_by_id,
 )
 
 router = APIRouter(prefix="/api/booking", tags=["Booking"])
@@ -137,3 +139,29 @@ async def final_amount(
         raise HTTPException(404, "Booking not found")
 
     return result
+
+
+#getAll bookings
+@router.get("/all")
+async def get_all(
+    page: int = 1,
+    size: int = 10,
+    service_type: str = None,
+    selected_service: str = None,
+    db: AsyncSession = Depends(get_db),
+):
+    return await list_bookings(db, page, size, service_type, selected_service)
+
+
+# getbyid booking
+@router.get("/{booking_id}")
+async def get_by_id(
+    booking_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    booking = await get_booking_by_id(booking_id, db)
+
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+
+    return booking

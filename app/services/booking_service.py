@@ -225,3 +225,45 @@ async def get_final_amount(booking_id, db):
         return None
 
     return {"total_amount": booking.total_amount}
+
+
+# ================= LIST BOOKINGS =================
+async def list_bookings(
+    db: AsyncSession,
+    page: int = 1,
+    size: int = 10,
+    service_type: str = None,
+    selected_service: str = None,
+):
+    query = select(Booking)
+
+    # ✅ FILTER: service_type
+    if service_type:
+        query = query.where(Booking.service_type == service_type)
+
+    # ✅ FILTER: selected_services (JSON contains)
+    if selected_service:
+        query = query.where(Booking.selected_services.contains([selected_service]))
+
+    # ✅ COUNT TOTAL
+    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
+    total = total_result.scalar()
+
+    # ✅ PAGINATION
+    query = query.offset((page - 1) * size).limit(size)
+
+    result = await db.execute(query)
+    bookings = result.scalars().all()
+
+    return {
+        "total": total,
+        "page": page,
+        "size": size,
+        "data": bookings,
+    }
+
+
+# ================= GET BOOKING BY ID =================
+async def get_booking_by_id(booking_id: int, db: AsyncSession):
+    result = await db.execute(select(Booking).where(Booking.id == booking_id))
+    return result.scalar_one_or_none()
